@@ -55,7 +55,7 @@ def run_statement(query, params=()):
         conn.close()
 
 
-def paginate(items, page=1, per_page=6):
+def paginate(items, page=1, per_page=6, base_path="/blog"):
     page = max(1, int(page or 1))
     total = len(items)
     total_pages = max(1, (total + per_page - 1) // per_page)
@@ -68,8 +68,40 @@ def paginate(items, page=1, per_page=6):
         "last_page": total_pages,
         "total": total,
         "per_page": per_page,
-        "next_page_url": f"/blog?page={page + 1}" if page < total_pages else None,
-        "prev_page_url": f"/blog?page={page - 1}" if page > 1 else None,
+        "next_page_url": f"{base_path}?page={page + 1}" if page < total_pages else None,
+        "prev_page_url": f"{base_path}?page={page - 1}" if page > 1 else None,
+    }
+
+
+def parse_json_array(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    try:
+        parsed = json.loads(value)
+        return parsed if isinstance(parsed, list) else []
+    except (TypeError, ValueError):
+        return []
+
+
+def map_product_row(product, category_override=None):
+    category = category_override or {
+        "id": product.get("category_id"),
+        "name": product.get("category_name"),
+        "slug": product.get("category_slug"),
+    }
+    return {
+        "id": product["id"],
+        "slug": product["slug"],
+        "title": product["title"],
+        "description": product["description"],
+        "image": product["image"],
+        "sku": product["sku"],
+        "price": float(product["price"] or 0),
+        "tags": parse_json_array(product.get("tags")),
+        "category": category if category and category.get("name") else None,
+        "published_at": product["created_at"],
     }
 
 
@@ -294,6 +326,282 @@ def category_blog(slug):
         })
     except Exception as exc:
         return jsonify({"message": "Database error", "error": str(exc)}), 500
+
+
+@app.get("/api/products")
+def products():
+    try:
+        page = max(1, int(request.args.get("page", 1) or 1))
+        rows = run("""
+            SELECT p.*, c.name AS category_name, c.slug AS category_slug
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE p.status = 'published'
+            ORDER BY p.created_at DESC
+        """)
+        items = [map_product_row(row) for row in rows]
+        per_page = 12
+        paged = paginate(items, page, per_page, "/api/products")
+        return jsonify({
+            "data": paged["data"],
+            "current_page": paged["current_page"],
+            "last_page": paged["last_page"],
+            "total": paged["total"],
+            "per_page": paged["per_page"],
+            "next_page_url": paged["next_page_url"],
+            "prev_page_url": paged["prev_page_url"],
+        })
+    except Exception as exc:
+        return jsonify({"message": "Database error", "error": str(exc)}), 500
+
+
+@app.get("/api/products/<slug>")
+def product_detail(slug):
+    try:
+        row = run_one("""
+            SELECT p.*, c.name AS category_name, c.slug AS category_slug
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE p.slug = ? AND p.status = 'published'
+            LIMIT 1
+        """, (slug,))
+        if not row:
+            return jsonify({"message": "Product not found"}), 404
+        return jsonify({
+            "id": row["id"],
+            "title": row["title"],
+            "slug": row["slug"],
+            "description": row["description"],
+            "image": row["image"],
+            "sku": row["sku"],
+            "price": float(row["price"] or 0),
+            "tags": parse_json_array(row.get("tags")),
+            "custom_fields": parse_json_array(row.get("custom_fields")),
+            "variations": parse_json_array(row.get("variations")),
+            "category": {
+                "id": row["category_id"],
+                "name": row["category_name"],
+                "slug": row["category_slug"],
+            } if row.get("category_name") else None,
+        })
+    except Exception as exc:
+        return jsonify({"message": "Database error", "error": str(exc)}), 500
+
+
+@app.get("/api/products/category/<slug>")
+def product_category(slug):
+    try:
+        category = run_one("SELECT id, name, slug FROM categories WHERE slug = ? LIMIT 1", (slug,))
+        if not category:
+            return jsonify({"message": "Category not found"}), 404
+
+        rows = run("""
+            SELECT p.*, c.name AS category_name, c.slug AS category_slug
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE p.category_id = ? AND p.status = 'published'
+            ORDER BY p.created_at DESC
+        """, (category["id"],))
+        items = [map_product_row(row, category) for row in rows]
+        page = max(1, int(request.args.get("page", 1) or 1))
+        per_page = 12
+        paged = paginate(items, page, per_page, f"/api/products/category/{category['slug']}")
+        return jsonify({
+            "category": category,
+            "data": paged["data"],
+            "current_page": paged["current_page"],
+            "last_page": paged["last_page"],
+            "total": paged["total"],
+            "per_page": paged["per_page"],
+            "next_page_url": paged["next_page_url"],
+            "prev_page_url": paged["prev_page_url"],
+        })
+    except Exception as exc:
+        return jsonify({"message": "Database error", "error": str(exc)}), 500
+
+
+@app.get("/api/products/tag/<tag>")
+def product_tag(tag):
+    try:
+        target_tag = str(tag).strip().lower()
+        rows = run("""
+            SELECT p.*, c.name AS category_name, c.slug AS category_slug
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            WHERE p.status = 'published'
+            ORDER BY p.created_at DESC
+        """)
+        filtered = []
+        for row in rows:
+            tag_values = [str(item).strip().lower() for item in parse_json_array(row.get("tags"))]
+            if target_tag in tag_values:
+                filtered.append(row)
+
+        items = [map_product_row(row) for row in filtered]
+        page = max(1, int(request.args.get("page", 1) or 1))
+        per_page = 12
+        paged = paginate(items, page, per_page, f"/api/products/tag/{tag}")
+        return jsonify({
+            "tag": tag,
+            "data": paged["data"],
+            "current_page": paged["current_page"],
+            "last_page": paged["last_page"],
+            "total": paged["total"],
+            "per_page": paged["per_page"],
+            "next_page_url": paged["next_page_url"],
+            "prev_page_url": paged["prev_page_url"],
+        })
+    except Exception as exc:
+        return jsonify({"message": "Database error", "error": str(exc)}), 500
+
+
+@app.get("/api/product-categories")
+def product_categories():
+    try:
+        rows = run("SELECT id, name, slug FROM categories ORDER BY name ASC")
+        return jsonify(rows)
+    except Exception as exc:
+        return jsonify({"message": "Database error", "error": str(exc)}), 500
+
+
+@app.get("/api/product-tags")
+def product_tags():
+    try:
+        rows = run("SELECT tags FROM products WHERE status = 'published'")
+        values = []
+        for row in rows:
+            values.extend(parse_json_array(row.get("tags")))
+        unique = sorted({str(value).strip() for value in values if str(value).strip()})
+        return jsonify(unique)
+    except Exception as exc:
+        return jsonify({"message": "Database error", "error": str(exc)}), 500
+
+
+@app.get("/api/products-admin")
+@token_required
+@require_role("admin", "editor")
+def products_admin():
+    try:
+        rows = run("""
+            SELECT p.*, c.name AS category_name, c.slug AS category_slug
+            FROM products p
+            LEFT JOIN categories c ON c.id = p.category_id
+            ORDER BY p.id DESC
+        """)
+        return jsonify([
+            {
+                "id": row["id"],
+                "title": row["title"],
+                "slug": row["slug"],
+                "sku": row["sku"],
+                "price": float(row["price"] or 0),
+                "status": row["status"],
+                "image": row["image"],
+                "category": {
+                    "id": row["category_id"],
+                    "name": row["category_name"],
+                    "slug": row["category_slug"],
+                } if row.get("category_name") else None,
+                "tags": parse_json_array(row.get("tags")),
+                "custom_fields": parse_json_array(row.get("custom_fields")),
+                "variations": parse_json_array(row.get("variations")),
+                "created_at": row["created_at"],
+            }
+            for row in rows
+        ])
+    except Exception as exc:
+        return jsonify({"message": "Database error", "error": str(exc)}), 500
+
+
+@app.post("/api/products-admin")
+@token_required
+@require_role("admin", "editor")
+def create_product():
+    data = request.get_json(silent=True) or {}
+    title = data.get("title")
+    slug = data.get("slug")
+    sku = data.get("sku")
+    price = data.get("price")
+
+    if not title or not slug or not sku or price is None:
+        return jsonify({"message": "Title, slug, sku and price are required"}), 400
+
+    existing = run_one("SELECT id FROM products WHERE slug = ?", (slug,))
+    if existing:
+        return jsonify({"message": "Slug already exists"}), 409
+
+    existing_sku = run_one("SELECT id FROM products WHERE sku = ?", (sku,))
+    if existing_sku:
+        return jsonify({"message": "SKU already exists"}), 409
+
+    result = run_statement(
+        'INSERT INTO products (user_id, category_id, title, slug, description, image, sku, price, tags, custom_fields, variations, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime("now"), datetime("now"))',
+        (
+            request.user["id"],
+            data.get("category_id"),
+            title,
+            slug,
+            data.get("description"),
+            data.get("image"),
+            sku,
+            float(price),
+            json.dumps(data.get("tags")) if data.get("tags") is not None else None,
+            json.dumps(data.get("custom_fields")) if data.get("custom_fields") is not None else None,
+            json.dumps(data.get("variations")) if data.get("variations") is not None else None,
+            data.get("status", "draft"),
+        ),
+    )
+    product = run_one("SELECT * FROM products WHERE id = ?", (result["id"],))
+    return jsonify(product), 201
+
+
+@app.put("/api/products-admin/<product>")
+@token_required
+@require_role("admin", "editor")
+def update_product(product):
+    data = request.get_json(silent=True) or {}
+    current = run_one("SELECT * FROM products WHERE id = ?", (product,))
+    if not current:
+        return jsonify({"message": "Product not found"}), 404
+
+    next_slug = data.get("slug") or current["slug"]
+    if run_one("SELECT id FROM products WHERE slug = ? AND id != ?", (next_slug, product)):
+        return jsonify({"message": "Slug already exists"}), 409
+
+    next_sku = data.get("sku") or current["sku"]
+    if run_one("SELECT id FROM products WHERE sku = ? AND id != ?", (next_sku, product)):
+        return jsonify({"message": "SKU already exists"}), 409
+
+    run_statement(
+        'UPDATE products SET category_id = ?, title = ?, slug = ?, description = ?, image = ?, sku = ?, price = ?, tags = ?, custom_fields = ?, variations = ?, status = ?, updated_at = datetime("now") WHERE id = ?',
+        (
+            data.get("category_id", current["category_id"]),
+            data.get("title", current["title"]),
+            next_slug,
+            data.get("description", current["description"]),
+            data.get("image", current["image"]),
+            next_sku,
+            float(data.get("price", current["price"] or 0)),
+            json.dumps(data.get("tags", parse_json_array(current.get("tags")))) if "tags" in data else current.get("tags"),
+            json.dumps(data.get("custom_fields", parse_json_array(current.get("custom_fields")))) if "custom_fields" in data else current.get("custom_fields"),
+            json.dumps(data.get("variations", parse_json_array(current.get("variations")))) if "variations" in data else current.get("variations"),
+            data.get("status", current["status"]),
+            product,
+        ),
+    )
+    updated = run_one("SELECT * FROM products WHERE id = ?", (product,))
+    return jsonify(updated), 200
+
+
+@app.delete("/api/products-admin/<product>")
+@token_required
+@require_role("admin")
+def delete_product(product):
+    current = run_one("SELECT * FROM products WHERE id = ?", (product,))
+    if not current:
+        return jsonify({"message": "Product not found"}), 404
+    run_statement("DELETE FROM products WHERE id = ?", (product,))
+    return jsonify({"message": "Product deleted successfully"})
 
 
 @app.post("/api/register")
